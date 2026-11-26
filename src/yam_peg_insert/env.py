@@ -2,20 +2,30 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import gymnasium as gym
-from gymnasium import spaces
 import mujoco
 import numpy as np
+from gymnasium import spaces
 
 from yam_peg_insert.scene import load_peg_insert_model
+
+# Gripper opening used in the home pose (matches the finger actuator range).
+GRIPPER_OPEN = 0.0375
+
+# Workbench footprint used to decide when the peg has fallen off the table.
+_TABLE_CENTER_XY = np.array([0.35, 0.0])
+_TABLE_RADIUS = 0.45
 
 
 class YamPegInsertEnv(gym.Env[np.ndarray, np.ndarray]):
     """Single-arm YAM peg-in-hole environment running natively on CPU MuJoCo."""
 
-    metadata = {"render_modes": ["rgb_array"], "render_fps": 25}
+    metadata: ClassVar[dict[str, Any]] = {
+        "render_modes": ["rgb_array"],
+        "render_fps": 25,
+    }
 
     def __init__(
         self,
@@ -39,12 +49,47 @@ class YamPegInsertEnv(gym.Env[np.ndarray, np.ndarray]):
         self._socket_bottom_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_SITE, "socket_bottom"
         )
+        self._grasp_site_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_SITE, "grasp_site"
+        )
+        self._peg_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "peg"
+        )
         self._peg_joint_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_JOINT, "peg_freejoint"
         )
+        self._gripper_act_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, "gripper"
+        )
+        self._home_key_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_KEY, "home"
+        )
+        self._left_finger_qadr = self.model.jnt_qposadr[
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "left_finger")
+        ]
+        self._right_finger_qadr = self.model.jnt_qposadr[
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "right_finger")
+        ]
 
-        # Observation: [ctrl (nu), qpos_arm (nu), qvel_arm (nu), peg_to_socket (3), contact_count (1)]
-        obs_dim = self.nu * 3 + 4
+        # Every robot joint except the peg's freejoint (hinge/slide -> 1 DoF each).
+        qpos_idx: list[int] = []
+        qvel_idx: list[int] = []
+        for joint_id in range(self.model.njnt):
+            if joint_id == self._peg_joint_id:
+                continue
+            jtype = int(self.model.jnt_type[joint_id])
+            if jtype in (
+                int(mujoco.mjtJoint.mjJNT_HINGE),
+                int(mujoco.mjtJoint.mjJNT_SLIDE),
+            ):
+                qpos_idx.append(int(self.model.jnt_qposadr[joint_id]))
+                qvel_idx.append(int(self.model.jnt_dofadr[joint_id]))
+        self._robot_qpos_idx = np.asarray(qpos_idx, dtype=np.int32)
+        self._robot_qvel_idx = np.asarray(qvel_idx, dtype=np.int32)
+
+        # Observation: ctrl (nu), qpos_robot, qvel_robot, grasp->peg (3),
+        # peg_tip->socket (3), peg z-axis (3), contact count (1).
+        obs_dim = self.nu + 2 * len(self._robot_qpos_idx) + 10
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
@@ -56,14 +101,26 @@ class YamPegInsertEnv(gym.Env[np.ndarray, np.ndarray]):
     def _get_obs(self) -> np.ndarray:
         peg_tip = self.data.site_xpos[self._peg_tip_id]
         socket_bottom = self.data.site_xpos[self._socket_bottom_id]
-        rel = socket_bottom - peg_tip
+        peg_pos = self.data.xpos[self._peg_body_id]
+        grasp_pos = self.data.site_xpos[self._grasp_site_id]
+        peg_z_axis = self.data.xmat[self._peg_body_id].reshape(3, 3)[:, 2]
 
-        qpos_arm = self.data.qpos[: self.nu]
-        qvel_arm = self.data.qvel[: self.nu]
+        qpos_robot = self.data.qpos[self._robot_qpos_idx]
+        qvel_robot = self.data.qvel[self._robot_qvel_idx]
         ctrl = self.data.ctrl[: self.nu]
         ncon = np.array([float(self.data.ncon)], dtype=np.float64)
 
-        return np.concatenate([ctrl, qpos_arm, qvel_arm, rel, ncon]).astype(np.float32)
+        return np.concatenate(
+            [
+                ctrl,
+                qpos_robot,
+                qvel_robot,
+                peg_pos - grasp_pos,
+                socket_bottom - peg_tip,
+                peg_z_axis,
+                ncon,
+            ]
+        ).astype(np.float32)
 
     def _compute_reward(self) -> tuple[float, bool, dict[str, Any]]:
         peg_tip = self.data.site_xpos[self._peg_tip_id]
@@ -71,12 +128,35 @@ class YamPegInsertEnv(gym.Env[np.ndarray, np.ndarray]):
         dist = float(np.linalg.norm(socket_bottom - peg_tip))
 
         reward = -dist - 0.01 * float(np.sum(np.square(self.data.ctrl)))
-        inserted = dist < 0.015
+
+        rel = peg_tip - socket_bottom
+        peg_z_axis = self.data.xmat[self._peg_body_id].reshape(3, 3)[:, 2]
+        upright = bool(abs(float(peg_z_axis[2])) > 0.90)
+        inserted = bool(
+            abs(float(rel[0])) < 0.015
+            and abs(float(rel[1])) < 0.015
+            and -0.005 < float(rel[2]) < 0.018
+            and upright
+        )
+
+        peg_pos = self.data.xpos[self._peg_body_id]
+        dropped = bool(
+            peg_pos[2] < -0.005
+            or np.linalg.norm(peg_pos[:2] - _TABLE_CENTER_XY) > _TABLE_RADIUS
+        )
+
         if inserted:
             reward += 5.0
+        if dropped:
+            reward -= 2.0
 
-        info = {"tip_to_socket_dist": dist, "is_success": inserted}
-        return reward, inserted, info
+        info = {
+            "tip_to_socket_dist": dist,
+            "is_success": inserted,
+            "dropped": dropped,
+            "peg_vertical": upright,
+        }
+        return reward, inserted or dropped, info
 
     def reset(
         self,
@@ -85,7 +165,16 @@ class YamPegInsertEnv(gym.Env[np.ndarray, np.ndarray]):
         options: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         super().reset(seed=seed)
-        mujoco.mj_resetData(self.model, self.data)
+        if self._home_key_id >= 0:
+            mujoco.mj_resetDataKeyframe(self.model, self.data, self._home_key_id)
+        else:
+            mujoco.mj_resetData(self.model, self.data)
+
+        # The home keyframe holds the fingers closed, which makes the two finger
+        # collision sets interpenetrate at t=0; start open instead.
+        self.data.qpos[self._left_finger_qadr] = GRIPPER_OPEN
+        self.data.qpos[self._right_finger_qadr] = -GRIPPER_OPEN
+        self.data.ctrl[self._gripper_act_id] = GRIPPER_OPEN
         self._step_count = 0
 
         if self._peg_joint_id >= 0:

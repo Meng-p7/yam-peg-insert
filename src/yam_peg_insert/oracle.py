@@ -1,4 +1,4 @@
-"""Damped-least-squares Jacobian IK oracle for scripted demos and data collection."""
+"""Damped-least-squares 6-DoF pose IK oracle for scripted demos and data collection."""
 
 from __future__ import annotations
 
@@ -7,58 +7,192 @@ import numpy as np
 
 from yam_peg_insert.env import YamPegInsertEnv
 
+# ``grasp_site`` is the menagerie virtual TCP; the actual jaw pinch point sits
+# a few centimetres away from it. The offset is measured from the model at home.
+_TIP_SPHERE_RADIUS = 1e-3
+
+_HOVER_HEIGHT = 0.10
+_GRASP_HEIGHT = 0.015
+_LIFT_HEIGHT = 0.12
+_TRANSFER_HEIGHT = 0.155  # pinch height above socket_bottom while crossing over it
+_INSERT_HEIGHT = 0.065  # pinch height above socket_bottom at full insertion
+
+_POS_TOL = 0.008
+_ROT_TOL = 0.15
+_GRASP_SYNC_TOL = 0.012
+_GRASP_SYNC_STEPS = 3
+_GRIP_CLOSE_STEPS = 25
+
+
+def _skew(vec: np.ndarray) -> np.ndarray:
+    return np.array(
+        [
+            [0.0, -vec[2], vec[1]],
+            [vec[2], 0.0, -vec[0]],
+            [-vec[1], vec[0], 0.0],
+        ]
+    )
+
+
+def _rotation_error(rot_cur: np.ndarray, rot_des: np.ndarray) -> np.ndarray:
+    """Axis-angle vector (world frame) rotating ``rot_cur`` onto ``rot_des``."""
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(quat, (rot_des @ rot_cur.T).reshape(-1))
+    if quat[0] < 0.0:
+        quat = -quat
+    w = float(np.clip(quat[0], -1.0, 1.0))
+    sin_half = float(np.sqrt(max(0.0, 1.0 - w * w)))
+    if sin_half < 1e-6:
+        return np.zeros(3)
+    return (2.0 * np.arctan2(sin_half, w) / sin_half) * quat[1:]
+
 
 class ScriptedPegOracle:
-    """Simple state-machine + Jacobian IK policy to guide the arm toward the peg/socket."""
+    """State-machine + 6-DoF pose IK policy for scripted peg-in-hole demos.
 
-    def __init__(self, env: YamPegInsertEnv, damping: float = 1e-2) -> None:
+    Phases: hover -> descend -> close -> lift -> transfer -> insert.
+    """
+
+    PHASE_NAMES = ("hover", "descend", "close", "lift", "transfer", "insert")
+
+    def __init__(
+        self,
+        env: YamPegInsertEnv,
+        damping: float = 0.05,
+        gain: float = 0.8,
+        slow_gain: float = 0.25,
+    ) -> None:
         self.env = env
         self.damping = damping
-        self._ee_body_id = self._find_ee_body_id()
-        self._peg_body_id = mujoco.mj_name2id(
-            env.model, mujoco.mjtObj.mjOBJ_BODY, "peg"
-        )
+        self.gain = gain
+        self.slow_gain = slow_gain
+        self._grasp_site_id = env._grasp_site_id
+        self._peg_body_id = env._peg_body_id
         self._socket_site_id = env._socket_bottom_id
+        self._desired_rot, self._pinch_offset = self._measure_hand_frame()
+        self._scratch = mujoco.MjData(env.model)
 
-    def _find_ee_body_id(self) -> int:
-        # Fallback to last non-world arm body before freejoint bodies
-        for candidate in ("link_6", "ee_link", "gripper_base"):
-            bid = mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_BODY, candidate)
-            if bid >= 0:
-                return bid
-        return max(1, self.env.model.nbody - 3)
+        self._phase = 0
+        self._phase_steps = 0
+        self._settle_steps = 0
+        self._peg_ref = np.zeros(3)
+        self._hold_target = np.zeros(3)
+
+    def _measure_hand_frame(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return the home grasp orientation and the pinch offset in the site frame."""
+        model = self.env.model
+        data = mujoco.MjData(model)
+        mujoco.mj_resetDataKeyframe(model, data, self.env._home_key_id)
+        mujoco.mj_forward(model, data)
+
+        rot = data.site_xmat[self._grasp_site_id].reshape(3, 3).copy()
+        grasp_pos = data.site_xpos[self._grasp_site_id]
+        tips = [
+            data.geom_xpos[geom_id]
+            for geom_id in range(model.ngeom)
+            if model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_SPHERE
+            and model.geom_size[geom_id][0] <= _TIP_SPHERE_RADIUS
+        ]
+        pinch = np.mean(tips, axis=0)
+        return rot, rot.T @ (pinch - grasp_pos)
+
+    def _pose(self, data: mujoco.MjData) -> tuple[np.ndarray, np.ndarray]:
+        """Pinch position and grasp-site rotation stored in ``data``."""
+        rot = data.site_xmat[self._grasp_site_id].reshape(3, 3)
+        pinch = data.site_xpos[self._grasp_site_id] + rot @ self._pinch_offset
+        return pinch, rot
+
+    def _start_episode(self) -> None:
+        self._phase = 0
+        self._phase_steps = 0
+        self._settle_steps = 0
+        self._peg_ref = self.env.data.xpos[self._peg_body_id].copy()
+
+    def _target_for_phase(self) -> tuple[np.ndarray, float]:
+        socket = self.env.data.site_xpos[self._socket_site_id]
+        peg = self._peg_ref
+
+        if self._phase == 0:
+            return np.array([peg[0], peg[1], peg[2] + _HOVER_HEIGHT]), 1.0
+        if self._phase == 1:
+            return np.array([peg[0], peg[1], peg[2] + _GRASP_HEIGHT]), 1.0
+        if self._phase == 2:
+            return self._hold_target, -1.0
+        if self._phase == 3:
+            return np.array([peg[0], peg[1], peg[2] + _LIFT_HEIGHT]), -1.0
+        if self._phase == 4:
+            return np.array([socket[0], socket[1], socket[2] + _TRANSFER_HEIGHT]), -1.0
+        return np.array([socket[0], socket[1], socket[2] + _INSERT_HEIGHT]), -1.0
+
+    def _advance_phase(self) -> None:
+        self._phase = min(self._phase + 1, len(self.PHASE_NAMES) - 1)
+        self._phase_steps = 0
+        self._settle_steps = 0
+        if self._phase == 2:
+            peg = self._peg_ref
+            self._hold_target = np.array([peg[0], peg[1], peg[2] + _GRASP_HEIGHT])
 
     def predict(self, step_idx: int) -> np.ndarray:
+        if step_idx == 0:
+            self._start_episode()
+
         model = self.env.model
         data = self.env.data
         nu = self.env.nu
-
-        ee_pos = data.xpos[self._ee_body_id]
-        peg_pos = data.xpos[self._peg_body_id]
-        socket_pos = data.site_xpos[self._socket_site_id]
-
-        # 3-phase target: hover above peg -> approach peg -> move above socket
-        if step_idx < 60:
-            target_pos = peg_pos + np.array([0.0, 0.0, 0.08])
-            gripper_cmd = 1.0
-        elif step_idx < 120:
-            target_pos = peg_pos + np.array([0.0, 0.0, 0.01])
-            gripper_cmd = -1.0
-        else:
-            target_pos = socket_pos + np.array([0.0, 0.0, 0.06])
-            gripper_cmd = -1.0
-
-        err = target_pos - ee_pos
-        jacp = np.zeros((3, model.nv))
-        mujoco.mj_jacBody(model, data, jacp, None, self._ee_body_id)
-
         arm_dof = max(1, nu - 1)
-        j_arm = jacp[:, :arm_dof]
-        jjt = j_arm @ j_arm.T + (self.damping**2) * np.eye(3)
-        dq = j_arm.T @ np.linalg.solve(jjt, err)
+
+        target, gripper_cmd = self._target_for_phase()
+
+        # Plan on the commanded joint targets rather than the measured joints:
+        # the position servos are under-damped, and closing the loop on the
+        # measured state produces a limit cycle at these control rates.
+        scratch = self._scratch
+        scratch.qpos[:] = data.qpos
+        scratch.qpos[:arm_dof] = data.ctrl[:arm_dof]
+        mujoco.mj_forward(model, scratch)
+        pinch_cmd, rot_cmd = self._pose(scratch)
+
+        err_pos = target - pinch_cmd
+        err_rot = _rotation_error(rot_cmd, self._desired_rot)
+        pos_ok = float(np.linalg.norm(err_pos)) < _POS_TOL
+        rot_ok = float(np.linalg.norm(err_rot)) < _ROT_TOL
+
+        pinch_act, _ = self._pose(data)
+        actual_err = float(np.linalg.norm(target - pinch_act))
+
+        self._phase_steps += 1
+        if self._phase == 2:
+            if self._phase_steps >= _GRIP_CLOSE_STEPS:
+                self._advance_phase()
+        elif self._phase == 1:
+            # Wait until the physical arm has caught up before closing the jaws.
+            if pos_ok and rot_ok and actual_err < _GRASP_SYNC_TOL:
+                self._settle_steps += 1
+                if self._settle_steps >= _GRASP_SYNC_STEPS:
+                    self._advance_phase()
+            else:
+                self._settle_steps = 0
+        elif self._phase < 5 and pos_ok and rot_ok:
+            self._advance_phase()
+
+        jacp = np.zeros((3, model.nv))
+        jacr = np.zeros((3, model.nv))
+        mujoco.mj_jacSite(model, scratch, jacp, jacr, self._grasp_site_id)
+
+        # Jacobian of the pinch point (rigid offset from the site origin).
+        offset_world = rot_cmd @ self._pinch_offset
+        jacp_pinch = jacp - _skew(offset_world) @ jacr
+
+        jac = np.vstack([jacp_pinch[:, :arm_dof], jacr[:, :arm_dof]])
+        err = np.concatenate([err_pos, 0.5 * err_rot])
+        damping = (self.damping**2) * np.eye(6)
+        dq = jac.T @ np.linalg.solve(jac @ jac.T + damping, err)
 
         action = np.zeros(nu, dtype=np.float32)
-        action[:arm_dof] = np.clip(dq / max(self.env.action_scale, 1e-6), -1.0, 1.0)
+        gain = self.gain if self._phase < 3 else self.slow_gain
+        action[:arm_dof] = np.clip(
+            gain * dq / max(self.env.action_scale, 1e-6), -1.0, 1.0
+        )
         if nu > arm_dof:
             action[arm_dof:] = gripper_cmd
         return action

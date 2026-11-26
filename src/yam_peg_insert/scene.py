@@ -5,6 +5,10 @@ from __future__ import annotations
 import mujoco
 import mujoco_menagerie as mm
 
+# Menagerie ships the YAM finger servo with kp=100, which is too weak to carry
+# the peg reliably; the oracle is tuned against this stiffer jaw servo.
+GRIPPER_KP = 800.0
+
 
 def build_peg_insert_spec(
     socket_pos: tuple[float, float, float] = (0.38, 0.0, 0.02),
@@ -84,7 +88,11 @@ def build_peg_insert_spec(
     peg_geom.size = [0.012, 0.045, 0.0]
     peg_geom.mass = 0.08
     peg_geom.rgba = [0.85, 0.35, 0.18, 1.0]
-    peg_geom.friction = [0.9, 0.005, 0.0001]
+    # High sliding/torsional friction so the parallel jaws can hold the shaft
+    # without slipping; condim=4 enables the torsional friction term.
+    peg_geom.friction = [1.0, 0.05, 0.001]
+    peg_geom.condim = 4
+    peg_geom.solref = [0.01, 1.0]
 
     peg_tip = peg_body.add_site()
     peg_tip.name = "peg_tip"
@@ -107,6 +115,24 @@ def load_peg_insert_model(**kwargs) -> tuple[mujoco.MjModel, mujoco.MjData]:
     """Compile MjSpec into (MjModel, MjData) ready for simulation."""
     spec = build_peg_insert_spec(**kwargs)
     model = spec.compile()
+
+    # The IK oracle relies on these menagerie-provided assets.
+    for obj, name in (
+        (mujoco.mjtObj.mjOBJ_SITE, "grasp_site"),
+        (mujoco.mjtObj.mjOBJ_KEY, "home"),
+    ):
+        if mujoco.mj_name2id(model, obj, name) < 0:
+            raise RuntimeError(
+                f"i2rt_yam model is missing required {obj.name} {name!r}"
+            )
+
+    # The menagerie finger servo (kp=100) barely holds the 80 g peg: the jaw
+    # normal force stays below ~1 N, so the peg slips out during transport.
+    # Stiffen it so the jaws can carry the peg without sliding.
+    gripper_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "gripper")
+    model.actuator_gainprm[gripper_id, 0] = GRIPPER_KP
+    model.actuator_biasprm[gripper_id, 1] = -GRIPPER_KP
+
     data = mujoco.MjData(model)
     mujoco.mj_resetData(model, data)
     mujoco.mj_forward(model, data)
