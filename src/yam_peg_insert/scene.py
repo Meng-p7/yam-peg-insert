@@ -14,7 +14,9 @@ def build_peg_insert_spec(
     wall_height: float = 0.04,
 ) -> mujoco.MjSpec:
     """Load i2rt_yam from MuJoCo Menagerie and attach floor, light, table, socket, and peg."""
-    spec = mm.get("i2rt_yam").spec()
+    # Use the robot-only entry point: menagerie's scene.xml already defines a
+    # "floor" geom and light, which would collide with the ones added below.
+    spec = mm.get("i2rt_yam").spec("yam")
     world = spec.worldbody
 
     # Ground plane & overhead light (menagerie robot XMLs omit scene lighting/floor)
@@ -94,7 +96,9 @@ def build_peg_insert_spec(
     cam = world.add_camera()
     cam.name = "overhead_cam"
     cam.pos = [0.35, 0.0, 0.75]
-    cam.xyaxes = [0.0, -1.0, 0.0, 1.0, 0.0, 0.0]
+    # MjSpec cameras expose a quaternion only (no xyaxes on MjsCamera).
+    # 180 deg yaw about Z (x->-x, y->-y), looking straight down.
+    cam.quat = [0.0, 0.0, 0.0, 1.0]
 
     return spec
 
