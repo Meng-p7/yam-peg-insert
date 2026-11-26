@@ -14,6 +14,13 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=5)
     args = parser.parse_args()
 
+    if not args.checkpoint.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {args.checkpoint}. "
+            "Run notebooks/train_colab_ppo.ipynb on Colab first and place the "
+            ".zip under checkpoints/."
+        )
+
     from stable_baselines3 import PPO
 
     env = YamPegInsertEnv()
