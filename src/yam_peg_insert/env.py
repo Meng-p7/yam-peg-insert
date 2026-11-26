@@ -70,7 +70,6 @@ class YamPegInsertEnv(gym.Env[np.ndarray, np.ndarray]):
         socket_bottom = self.data.site_xpos[self._socket_bottom_id]
         dist = float(np.linalg.norm(socket_bottom - peg_tip))
 
-        # Smooth distance reward + success bonus when tip reaches bottom of socket
         reward = -dist - 0.01 * float(np.sum(np.square(self.data.ctrl)))
         inserted = dist < 0.015
         if inserted:
@@ -89,7 +88,6 @@ class YamPegInsertEnv(gym.Env[np.ndarray, np.ndarray]):
         mujoco.mj_resetData(self.model, self.data)
         self._step_count = 0
 
-        # Small randomization on peg initial XY position
         if self._peg_joint_id >= 0:
             qadr = self.model.jnt_qposadr[self._peg_joint_id]
             dx, dy = self.np_random.uniform(-0.02, 0.02, size=2)

@@ -9,7 +9,7 @@ def main() -> None:
     print(f"Reset OK | obs shape={obs.shape}, action dim={env.action_space.shape}")
 
     total_reward = 0.0
-    for step in range(50):
+    for _ in range(50):
         action = env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward

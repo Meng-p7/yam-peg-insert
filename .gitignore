@@ -5,5 +5,8 @@ __pycache__/
 .ruff_cache/
 logs/
 checkpoints/
+demos/
 *.mp4
+*.npz
 .DS_Store
+.workbuddy/

@@ -8,18 +8,30 @@ import mujoco_menagerie as mm
 
 def build_peg_insert_spec(
     socket_pos: tuple[float, float, float] = (0.38, 0.0, 0.02),
-    peg_pos: tuple[float, float, float] = (0.28, -0.14, 0.05),
+    peg_pos: tuple[float, float, float] = (0.28, -0.14, 0.045),
     hole_half_width: float = 0.018,
     wall_thickness: float = 0.015,
     wall_height: float = 0.04,
 ) -> mujoco.MjSpec:
-    """Load i2rt_yam from MuJoCo Menagerie and attach table, socket, and peg."""
+    """Load i2rt_yam from MuJoCo Menagerie and attach floor, light, table, socket, and peg."""
     spec = mm.get("i2rt_yam").spec()
-
-    # Ensure a ground plane and overhead lighting exist
     world = spec.worldbody
 
-    # Simple workbench surface slightly below z=0 or at z=0
+    # Ground plane & overhead light (menagerie robot XMLs omit scene lighting/floor)
+    floor = world.add_geom()
+    floor.name = "floor"
+    floor.type = mujoco.mjtGeom.mjGEOM_PLANE
+    floor.size = [2.0, 2.0, 0.1]
+    floor.pos = [0.0, 0.0, -0.04]
+    floor.rgba = [0.95, 0.96, 0.97, 1.0]
+
+    light = world.add_light()
+    light.name = "overhead_light"
+    light.pos = [0.4, 0.0, 1.5]
+    light.dir = [0.0, 0.0, -1.0]
+    light.diffuse = [0.85, 0.85, 0.85]
+
+    # Workbench surface
     table = world.add_geom()
     table.name = "workbench_top"
     table.type = mujoco.mjtGeom.mjGEOM_BOX

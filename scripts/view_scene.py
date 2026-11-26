@@ -1,6 +1,5 @@
 """Interactive MuJoCo viewer for the YAM Peg-in-Hole scene."""
 
-import mujoco
 import mujoco.viewer
 
 from yam_peg_insert import load_peg_insert_model
