@@ -131,18 +131,22 @@ class YamPegInsertEnv(gym.Env[np.ndarray, np.ndarray]):
 
         rel = peg_tip - socket_bottom
         peg_z_axis = self.data.xmat[self._peg_body_id].reshape(3, 3)[:, 2]
-        upright = bool(abs(float(peg_z_axis[2])) > 0.90)
+        upright = bool(abs(float(peg_z_axis[2])) > 0.92)
+        # The hole is 36 mm wide and the peg 24 mm, so the real lateral clearance
+        # is only +-6 mm; anything looser lets a peg resting on the rim pass.
         inserted = bool(
-            abs(float(rel[0])) < 0.015
-            and abs(float(rel[1])) < 0.015
-            and -0.005 < float(rel[2]) < 0.018
+            abs(float(rel[0])) < 0.0055
+            and abs(float(rel[1])) < 0.0055
+            and -0.004 < float(rel[2]) < 0.006
             and upright
         )
 
         peg_pos = self.data.xpos[self._peg_body_id]
+        tipped = bool(abs(float(peg_z_axis[2])) < 0.50 and float(peg_pos[2]) < 0.035)
         dropped = bool(
             peg_pos[2] < -0.005
             or np.linalg.norm(peg_pos[:2] - _TABLE_CENTER_XY) > _TABLE_RADIUS
+            or tipped
         )
 
         if inserted:
@@ -154,6 +158,7 @@ class YamPegInsertEnv(gym.Env[np.ndarray, np.ndarray]):
             "tip_to_socket_dist": dist,
             "is_success": inserted,
             "dropped": dropped,
+            "tipped": tipped,
             "peg_vertical": upright,
         }
         return reward, inserted or dropped, info

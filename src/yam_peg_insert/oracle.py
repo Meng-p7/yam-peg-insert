@@ -12,16 +12,18 @@ from yam_peg_insert.env import YamPegInsertEnv
 _TIP_SPHERE_RADIUS = 1e-3
 
 _HOVER_HEIGHT = 0.10
-_GRASP_HEIGHT = 0.015
+_GRASP_HEIGHT = 0.030  # grip the upper shaft: 15 mm below the peg top
 _LIFT_HEIGHT = 0.12
-_TRANSFER_HEIGHT = 0.155  # pinch height above socket_bottom while crossing over it
-_INSERT_HEIGHT = 0.065  # pinch height above socket_bottom at full insertion
+_TRANSFER_HEIGHT = 0.165  # pinch height above socket_bottom while crossing over it
+_INSERT_HEIGHT = 0.077  # pinch height above socket_bottom at full insertion
+_INSERT_TIP_DEPTH = 0.002  # desired peg-tip height above socket_bottom
 
 _POS_TOL = 0.008
 _ROT_TOL = 0.15
 _GRASP_SYNC_TOL = 0.012
 _GRASP_SYNC_STEPS = 3
 _GRIP_CLOSE_STEPS = 25
+_MAX_PHASE_STEPS = 80
 
 
 def _skew(vec: np.ndarray) -> np.ndarray:
@@ -68,15 +70,22 @@ class ScriptedPegOracle:
         self.slow_gain = slow_gain
         self._grasp_site_id = env._grasp_site_id
         self._peg_body_id = env._peg_body_id
+        self._peg_tip_id = env._peg_tip_id
         self._socket_site_id = env._socket_bottom_id
         self._desired_rot, self._pinch_offset = self._measure_hand_frame()
         self._scratch = mujoco.MjData(env.model)
+
+        home_data = mujoco.MjData(env.model)
+        mujoco.mj_resetDataKeyframe(env.model, home_data, env._home_key_id)
+        self._q_home = home_data.qpos[: max(1, env.nu - 1)].copy()
+        self.last_status: str = "ok"
 
         self._phase = 0
         self._phase_steps = 0
         self._settle_steps = 0
         self._peg_ref = np.zeros(3)
         self._hold_target = np.zeros(3)
+        self._insert_cmd = np.zeros(3)
 
     def _measure_hand_frame(self) -> tuple[np.ndarray, np.ndarray]:
         """Return the home grasp orientation and the pinch offset in the site frame."""
@@ -122,7 +131,24 @@ class ScriptedPegOracle:
             return np.array([peg[0], peg[1], peg[2] + _LIFT_HEIGHT]), -1.0
         if self._phase == 4:
             return np.array([socket[0], socket[1], socket[2] + _TRANSFER_HEIGHT]), -1.0
-        return np.array([socket[0], socket[1], socket[2] + _INSERT_HEIGHT]), -1.0
+
+        target = np.array([socket[0], socket[1], socket[2] + _INSERT_HEIGHT])
+        # Close the loop on the measured peg tip: the jaws let the peg sag a few
+        # millimetres under load, so an open-loop depth lands inconsistently.
+        tip = self.env.data.site_xpos[self._peg_tip_id]
+        target[2] += float(
+            np.clip(0.5 * (socket[2] + _INSERT_TIP_DEPTH - tip[2]), -0.003, 0.003)
+        )
+        target[:2] += np.clip(0.5 * (socket[:2] - tip[:2]), -0.003, 0.003)
+        # Rate-limit the descent: the joint-space action clip is ~7 mm/step at
+        # the wrist, which slams the peg into the table and makes it slip.
+        delta = target - self._insert_cmd
+        max_step = 0.0025
+        norm = float(np.linalg.norm(delta))
+        if norm > max_step:
+            delta *= max_step / norm
+        self._insert_cmd += delta
+        return self._insert_cmd, -1.0
 
     def _advance_phase(self) -> None:
         self._phase = min(self._phase + 1, len(self.PHASE_NAMES) - 1)
@@ -131,6 +157,10 @@ class ScriptedPegOracle:
         if self._phase == 2:
             peg = self._peg_ref
             self._hold_target = np.array([peg[0], peg[1], peg[2] + _GRASP_HEIGHT])
+        if self._phase == 5:
+            socket = self.env.data.site_xpos[self._socket_site_id]
+            pinch, _ = self._pose(self.env.data)
+            self._insert_cmd = np.array([socket[0], socket[1], pinch[2]])
 
     def predict(self, step_idx: int) -> np.ndarray:
         if step_idx == 0:
@@ -175,6 +205,14 @@ class ScriptedPegOracle:
         elif self._phase < 5 and pos_ok and rot_ok:
             self._advance_phase()
 
+        if self._phase_steps > _MAX_PHASE_STEPS and self._phase < 5:
+            phase_name = self.PHASE_NAMES[self._phase]
+            self.last_status = (
+                f"timeout in phase '{phase_name}' after {self._phase_steps} steps "
+                f"(pos_err={np.linalg.norm(err_pos):.4f} m, "
+                f"rot_err={np.linalg.norm(err_rot):.3f} rad)"
+            )
+
         jacp = np.zeros((3, model.nv))
         jacr = np.zeros((3, model.nv))
         mujoco.mj_jacSite(model, scratch, jacp, jacr, self._grasp_site_id)
@@ -186,7 +224,13 @@ class ScriptedPegOracle:
         jac = np.vstack([jacp_pinch[:, :arm_dof], jacr[:, :arm_dof]])
         err = np.concatenate([err_pos, 0.5 * err_rot])
         damping = (self.damping**2) * np.eye(6)
-        dq = jac.T @ np.linalg.solve(jac @ jac.T + damping, err)
+        jac_pinv = jac.T @ np.linalg.inv(jac @ jac.T + damping)
+        dq = jac_pinv @ err
+        # Pull redundant DoF back toward the home arm posture so the wrist does
+        # not settle against a joint limit (joint4 at +90 deg) mid-insertion.
+        null_proj = np.eye(arm_dof) - jac_pinv @ jac
+        dq_null = 0.05 * (self._q_home[:arm_dof] - scratch.qpos[:arm_dof])
+        dq = dq + null_proj @ dq_null
 
         action = np.zeros(nu, dtype=np.float32)
         gain = self.gain if self._phase < 3 else self.slow_gain

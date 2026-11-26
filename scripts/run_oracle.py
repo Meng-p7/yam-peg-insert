@@ -14,10 +14,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--record", action="store_true")
+    parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--out-dir", type=Path, default=Path("demos"))
     args = parser.parse_args()
 
-    env = YamPegInsertEnv(max_steps=300)
+    env = YamPegInsertEnv(max_steps=args.max_steps)
     oracle = ScriptedPegOracle(env)
 
     if args.record:
@@ -40,6 +41,17 @@ def main() -> None:
             f"reward={sum(rew_list):.3f} dist={info['tip_to_socket_dist']:.4f} m "
             f"success={info['is_success']}"
         )
+        if not info["is_success"]:
+            rel = (
+                env.data.site_xpos[env._peg_tip_id]
+                - env.data.site_xpos[env._socket_bottom_id]
+            )
+            print(
+                f"  oracle_status: {oracle.last_status} | "
+                f"dropped={info['dropped']} tipped={info['tipped']} | "
+                f"tip_rel=({rel[0] * 1000:+.1f}, {rel[1] * 1000:+.1f}, "
+                f"{rel[2] * 1000:+.1f}) mm"
+            )
         if args.record:
             out_file = args.out_dir / f"oracle_ep_{ep:03d}.npz"
             np.savez_compressed(
