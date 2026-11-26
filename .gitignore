@@ -6,6 +6,7 @@ __pycache__/
 logs/
 checkpoints/
 demos/
+datasets/
 *.mp4
 *.npz
 .DS_Store
