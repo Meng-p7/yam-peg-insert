@@ -16,7 +16,7 @@ else
 fi
 
 echo "[3/4] Creating isolated Python 3.12 virtualenv (.venv) without touching ROS 2 Python 3.10..."
-uv venv --python 3.12 .venv
+uv venv --python 3.12 --allow-existing .venv
 source .venv/bin/activate
 uv pip install -e ".[dev]"
 
