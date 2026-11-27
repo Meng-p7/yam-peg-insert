@@ -16,12 +16,6 @@ def main() -> None:
     parser.add_argument("--record", action="store_true")
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--out-dir", type=Path, default=Path("demos"))
-    parser.add_argument(
-        "--max-j4",
-        type=float,
-        default=1.48,
-        help="Skip recordings whose joint4 peak during the insert phase exceeds this.",
-    )
     args = parser.parse_args()
 
     env = YamPegInsertEnv(max_steps=args.max_steps)
@@ -33,12 +27,7 @@ def main() -> None:
     for ep in range(args.episodes):
         obs, _ = env.reset(seed=ep)
         obs_list, act_list, rew_list = [], [], []
-        max_j4_insert = 0.0
         for step in range(env.max_steps):
-            # joint4 peaks during grasp/lift by construction; only the insert
-            # phase is actionable for the wrist-limit filter.
-            if oracle.PHASE_NAMES[oracle._phase] == "insert":
-                max_j4_insert = max(max_j4_insert, float(obs[env.nu + 3]))
             action = oracle.predict(step)
             obs_list.append(obs)
             act_list.append(action)
@@ -50,7 +39,7 @@ def main() -> None:
         print(
             f"[Oracle Ep {ep}] steps={len(act_list)} "
             f"reward={sum(rew_list):.3f} dist={info['tip_to_socket_dist']:.4f} m "
-            f"success={info['is_success']} max_j4_insert={max_j4_insert:.3f} rad"
+            f"success={info['is_success']}"
         )
         if not info["is_success"]:
             rel = (
@@ -64,12 +53,6 @@ def main() -> None:
                 f"{rel[2] * 1000:+.1f}) mm"
             )
         if args.record:
-            if not info["is_success"] or max_j4_insert > args.max_j4:
-                print(
-                    f"  -> skip recording: success={info['is_success']}, "
-                    f"max_j4_insert={max_j4_insert:.3f} rad"
-                )
-                continue
             out_file = args.out_dir / f"oracle_ep_{ep:03d}.npz"
             np.savez_compressed(
                 out_file,
