@@ -82,9 +82,9 @@ pytest                                  # 单元测试
 
 ## 3. 数据集与训练
 
-- 数据集：[`dream0906/yam-v3`](https://huggingface.co/datasets/dream0906/yam-v3)，120 条纯净直插轨迹、16,434 帧、25 fps，包含 `observation.state`(33)、`action`(7) 与 `overhead_cam` 视频（360×480）。
+- 数据集：[`dream0906/yam-v3`](https://huggingface.co/datasets/dream0906/yam-v3)，50 条纯净直插轨迹、6,864 帧、25 fps，包含 `observation.state`(33)、`action`(7) 与 `overhead_cam` 视频（360×480）。
 - 转换：`python scripts/convert_demos_to_lerobot.py --demos-dir demos_v3 --repo-id dream0906/yam-v3 --root datasets/yam_v3 --overwrite --push-to-hub`
-- 训练：Kaggle T4 打开 [notebooks/train_colab_act.ipynb](notebooks/train_colab_act.ipynb)，ACT 训练 20k steps、batch 16、chunk 100。
+- 训练：Kaggle T4 打开 [notebooks/train_colab_act.ipynb](notebooks/train_colab_act.ipynb)，ACT 训练 30k steps、batch 8、chunk 100（与 v1 同配置，便于只对比场景差异）。
 - 产物：`outputs/train/act_yam_peg/checkpoints/last/pretrained_model/`（`config.json`、权重与 pre/post-processor）。
 
 ## 4. 本地 ACT 闭环评测
