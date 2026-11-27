@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <sub>ACT 策略在本地 CPU 上闭环完成插销（seed 0，144 步）· <a href="docs/media/act_success.mp4">MP4</a></sub>
+  <sub>ACT + Temporal Ensembling 在本地 CPU 上闭环完成插销（seed 0，142 步）· <a href="docs/media/act_success.mp4">MP4</a></sub>
 </p>
 
 基于 Google DeepMind [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie)（`i2rt_yam`）与 `mujoco.MjSpec` 构建的 **YAM 机械臂精密插销（Peg-in-Hole）** 项目。
@@ -20,14 +20,18 @@
 - 纵向偏差 `-4 mm < dz < 6 mm`
 - 插销轴保持竖直（`|z_axis| > 0.92`）
 
-| 策略 | 评测方式 | 成功率 | 成功耗时 | 销尖误差 |
+| 策略 / 推理配置 | 评测方式 | 成功率 | 成功耗时 | 主要失败 |
 |---|---|---|---|---|
-| 脚本 IK 专家（`oracle.py`） | 本地 CPU，50 seeds | **49/50（98%）** | 约 140 步 | 4.0–6.2 mm |
-| ACT（49 条示教，30k steps） | 本地 CPU 闭环，50 seeds | **15/50（30%）** | 144 ± 2 步 | 2.6–7.9 mm |
+| 脚本 IK 专家（`oracle.py`） | 本地 CPU，50 seeds | **49/50（98%）** | 约 140 步 | — |
+| ACT，100 步/次重规划 | 本地 CPU，50 seeds | 15/50（30%） | 144 ± 2 步 | 31 孔沿卡死、4 倾倒 |
+| ACT，10 步/次重规划 | 本地 CPU，50 seeds | 7/50（14%） | — | 35 超时、8 倾倒 |
+| **ACT + Temporal Ensembling（0.01）** | 本地 CPU，50 seeds | **33/50（66%）** | 143.8 步 | 11 孔沿卡死、6 倾倒 |
 
-孔壁高 40 mm，成功时插销插入深度约 **3 cm**。
+孔壁高 40 mm，成功时插销插入深度约 **3 cm**。成功轨迹的销尖误差 2.6–7.9 mm。
 
-ACT 失败分布：`31/50` 卡在孔口（销尖停在孔口上方 4–5 cm，压住孔沿，`ncon≈22`），`4/50` 插销倾倒。失败姿态下 `joint4` 已顶到 1.571 rad 限位。
+结论：100 步开环动作块是主要瓶颈；改用逐帧推理 + 时间集成（不重训）即可把成功率翻倍。把块长直接切到 10 步反而更差（块间跳变导致抖动），该负结果保留在脚本参数中以便复现。
+
+剩余失败仍集中在孔口：`11/50` 的销尖停在孔口上方 4–5 cm 并压住孔沿（`ncon≈22`），`6/50` 插销倾倒。失败姿态下 `joint4` 已顶到 1.571 rad 限位。
 
 ## 项目结构
 
@@ -84,19 +88,26 @@ pytest                                  # 单元测试
 ## 4. 本地 ACT 闭环评测
 
 ```bash
+# 推荐：逐帧时间集成（Temporal Ensembling）
 python scripts/eval_policy.py \
   --checkpoint /path/to/act_yam_peg/checkpoints/last/pretrained_model \
-  --episodes 50
+  --episodes 50 --te-coeff 0.01
+
+# 对照：checkpoint 默认的 100 步开环重规划
+python scripts/eval_policy.py --checkpoint /path/to/... --episodes 50
 ```
 
 脚本会逐帧渲染 `overhead_cam`、把 checkpoint 里写死的 `cuda` processor 重映射到 CPU，并输出每个 episode 的结果与汇总：
 
 ```text
 Suite: 50 episodes, 250 max steps/episode
-Success rate: 15/50 (30%)
-Mean success steps: 144.0
-Outcomes: {'success': 15, 'timeout': 31, 'tipped': 4}
+Replanning: temporal ensembling coeff=0.01, 1 action/inference
+Success rate: 33/50 (66%)
+Mean success steps: 143.8
+Outcomes: {'success': 33, 'timeout': 11, 'tipped': 6}
 ```
+
+`--n-action-steps N` 可切换成每 N 步重规划（用于复现 14% 的负结果）。
 
 ## 5. 环境设计
 
@@ -107,8 +118,8 @@ Outcomes: {'success': 15, 'timeout': 31, 'tipped': 4}
 
 ## 6. 已知限制
 
-- ACT 成功率 30%：到孔口后缺少柔顺对齐，压住孔沿后无法自行回退；开环执行 100 步动作块进一步削弱了修正能力。
-- 示教仅 49 条、初始位置随机 ±2 cm，视觉定位泛化有限。
+- 即使启用 TE，仍有 22% 的 episode 卡在孔口或倾倒：策略缺少接触柔顺，压住孔沿后不会回退重试。
+- 示教仅 49 条、初始位置随机 ±2 cm，且全部是“一次成功直插”，没有失败恢复片段。
 - 插入阶段 `joint4` 接近 1.571 rad 上限，部分位姿下腕部构型受限。
 - 训练权重不随仓库分发，需按第 3 节自行训练或放置 checkpoint。
 

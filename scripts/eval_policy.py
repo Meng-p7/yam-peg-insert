@@ -31,14 +31,28 @@ def _failure_reason(info: dict, truncated: bool) -> str:
 
 
 def evaluate(
-    checkpoint: Path, episodes: int, task: str, max_steps: int | None
+    checkpoint: Path,
+    episodes: int,
+    task: str,
+    max_steps: int | None,
+    n_action_steps: int | None,
+    te_coeff: float | None,
 ) -> None:
     import torch
-    from lerobot.policies.act.modeling_act import ACTPolicy
+    from lerobot.policies.act.modeling_act import ACTPolicy, ACTTemporalEnsembler
     from lerobot.policies.factory import make_pre_post_processors
 
     policy = ACTPolicy.from_pretrained(str(checkpoint))
     policy.to("cpu").eval()
+    if te_coeff is not None:
+        policy.config.n_action_steps = 1
+        policy.config.temporal_ensemble_coeff = te_coeff
+        policy.temporal_ensembler = ACTTemporalEnsembler(
+            te_coeff, policy.config.chunk_size
+        )
+    elif n_action_steps is not None:
+        policy.config.n_action_steps = n_action_steps
+    policy.reset()
     preprocessor, postprocessor = make_pre_post_processors(
         policy.config,
         pretrained_path=str(checkpoint),
@@ -98,6 +112,14 @@ def evaluate(
         env.close()
 
     print(f"\nSuite: {episodes} episodes, {env.max_steps} max steps/episode")
+    print(
+        "Replanning: "
+        + (
+            f"temporal ensembling coeff={te_coeff}, 1 action/inference"
+            if te_coeff is not None
+            else f"{policy.config.n_action_steps} actions/inference"
+        )
+    )
     print(f"Success rate: {successes}/{episodes} ({successes / episodes:.0%})")
     if success_steps:
         print(f"Mean success steps: {np.mean(success_steps):.1f}")
@@ -111,6 +133,18 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--task", type=str, default="Insert the peg into the socket")
+    parser.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=None,
+        help="Replan every N steps instead of the checkpoint's 100 (no retraining).",
+    )
+    parser.add_argument(
+        "--te-coeff",
+        type=float,
+        default=None,
+        help="Enable temporal ensembling with this coefficient (implies 1 step).",
+    )
     args = parser.parse_args()
 
     if not args.checkpoint.exists():
@@ -119,7 +153,14 @@ def main() -> None:
             "Train on Colab first and copy the exported pretrained_model here."
         )
 
-    evaluate(args.checkpoint, args.episodes, args.task, args.max_steps)
+    evaluate(
+        args.checkpoint,
+        args.episodes,
+        args.task,
+        args.max_steps,
+        args.n_action_steps,
+        args.te_coeff,
+    )
 
 
 if __name__ == "__main__":
