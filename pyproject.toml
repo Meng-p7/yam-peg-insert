@@ -12,9 +12,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-rl = [
-  "stable-baselines3>=2.4.0",
-  "torch>=2.4.0",
+act = [
+  "lerobot[dataset]>=0.7.0",
 ]
 dev = [
   "pytest>=8.0.0",

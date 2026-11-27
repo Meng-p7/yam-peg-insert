@@ -8,6 +8,7 @@ checkpoints/
 demos/
 datasets/
 *.mp4
+!docs/media/*.mp4
 *.npz
 .DS_Store
 .workbuddy/
