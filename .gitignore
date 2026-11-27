@@ -5,7 +5,7 @@ __pycache__/
 .ruff_cache/
 logs/
 checkpoints/
-demos/
+demos*/
 datasets/
 *.mp4
 !docs/media/*.mp4

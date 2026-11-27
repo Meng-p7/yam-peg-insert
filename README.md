@@ -14,6 +14,8 @@
 
 ## 实测结果（严格判据）
 
+> v2 分支说明：本节数据来自 `main`（v1 场景，孔座未抬高）。本分支已按优化方案抬高/前移孔座，并在示教中注入纠偏恢复段，需用新数据集 `dream0906/yam-v2` 重训后再刷新此表。
+
 成功判定（`env.py`）同时满足：
 
 - 横向偏差 `|dx|, |dy| < 5.5 mm`（孔宽 36 mm、销径 24 mm，物理单边间隙 6 mm）
@@ -126,3 +128,19 @@ Outcomes: {'success': 33, 'timeout': 11, 'tipped': 6}
 ## 致谢
 
 场景与机器人模型来自 [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) 的 `i2rt_yam`；数据集格式与训练、评测流程基于 [LeRobot](https://github.com/huggingface/lerobot)。
+
+## 附：v2 实验（`act-recovery-v2` 分支）
+
+- 场景：孔座改为 `(0.34, 0.0, 0.03)` 并加 10 mm 底座垫块；插销放在 `(0.31, -0.14, 0.045)`（方案中的 `0.26` 实测会让抓取位姿够不到，`descend` 阶段 9.8 mm 残差）。
+- 示教：50% 的 episode 注入 4–6 mm 横向偏置，接近孔口后抬升 8 mm 回中，再垂直下插。
+- 采数与转换：
+
+```bash
+python scripts/run_oracle.py --episodes 120 --record --out-dir demos_v2
+python scripts/convert_demos_to_lerobot.py --demos-dir demos_v2 \
+  --repo-id dream0906/yam-v2 --root datasets/yam_v2 --overwrite --push-to-hub
+```
+
+- 实测：oracle 116/120 成功（4 次握持/搬运失败）；`joint4` 峰值 1.515–1.561 rad。
+- `joint4` 峰值出现在 grasp/lift 而非插入，抬高孔座只改善了插入段；方案中的 1.48 rad 过滤阈值在本几何下不可达，脚本默认改为 1.56。
+- 下一步：Colab 用 `notebooks/train_colab_act.ipynb`（已指向 `yam-v2`）训练 30k–50k 步，下载权重后用 `eval_policy.py --te-coeff 0.01` 评测，再合并回 `main`。

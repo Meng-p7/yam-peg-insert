@@ -11,8 +11,8 @@ GRIPPER_KP = 800.0
 
 
 def build_peg_insert_spec(
-    socket_pos: tuple[float, float, float] = (0.38, 0.0, 0.02),
-    peg_pos: tuple[float, float, float] = (0.28, -0.14, 0.045),
+    socket_pos: tuple[float, float, float] = (0.34, 0.0, 0.03),
+    peg_pos: tuple[float, float, float] = (0.31, -0.14, 0.045),
     hole_half_width: float = 0.018,
     wall_thickness: float = 0.015,
     wall_height: float = 0.04,
@@ -74,6 +74,15 @@ def build_peg_insert_spec(
     socket_site.pos = [0.0, 0.0, -hh + 0.005]
     socket_site.size = [0.006, 0.006, 0.006]
     socket_site.rgba = [0.1, 0.8, 0.3, 0.8]
+
+    # Raise the fixture above the table top so the wrist does not have to reach
+    # as low during insertion (joint4 otherwise saturates at its 1.5708 limit).
+    base_pad = socket_body.add_geom()
+    base_pad.name = "socket_base_pad"
+    base_pad.type = mujoco.mjtGeom.mjGEOM_BOX
+    base_pad.size = [span, span, 0.005]
+    base_pad.pos = [0.0, 0.0, -hh - 0.005]
+    base_pad.rgba = [0.22, 0.25, 0.30, 1.0]
 
     # Graspable peg with freejoint
     peg_body = world.add_body()

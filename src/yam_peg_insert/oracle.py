@@ -17,6 +17,11 @@ _LIFT_HEIGHT = 0.12
 _TRANSFER_HEIGHT = 0.165  # pinch height above socket_bottom while crossing over it
 _INSERT_HEIGHT = 0.077  # pinch height above socket_bottom at full insertion
 _INSERT_TIP_DEPTH = 0.002  # desired peg-tip height above socket_bottom
+_PROBE_HEIGHT = 0.030  # probe stops this far above the insertion pinch height
+_RECENTER_HEIGHT = 0.038  # lift 8 mm above the probe before recentering
+_PROBE_STEPS = 6  # dwell at the probe pose before recentering
+_RECOVERY_PROB = 0.5  # fraction of demos that include a recovery segment
+_RECOVERY_RADIUS = (0.004, 0.006)  # lateral offset sampled for recovery demos
 
 _POS_TOL = 0.008
 _ROT_TOL = 0.15
@@ -52,10 +57,22 @@ def _rotation_error(rot_cur: np.ndarray, rot_des: np.ndarray) -> np.ndarray:
 class ScriptedPegOracle:
     """State-machine + 6-DoF pose IK policy for scripted peg-in-hole demos.
 
-    Phases: hover -> descend -> close -> lift -> transfer -> insert.
+    Phases: hover -> descend -> close -> lift -> transfer -> insert. Half of the
+    episodes insert a probe/recenter pair before insertion: approach with a
+    4-6 mm lateral offset, dip toward the rim, lift and re-center, then insert.
     """
 
     PHASE_NAMES = ("hover", "descend", "close", "lift", "transfer", "insert")
+    RECOVERY_PHASES = (
+        "hover",
+        "descend",
+        "close",
+        "lift",
+        "transfer",
+        "probe",
+        "recenter",
+        "insert",
+    )
 
     def __init__(
         self,
@@ -86,6 +103,9 @@ class ScriptedPegOracle:
         self._peg_ref = np.zeros(3)
         self._hold_target = np.zeros(3)
         self._insert_cmd = np.zeros(3)
+        self._phases: tuple[str, ...] = self.PHASE_NAMES
+        self._recovery_offset = np.zeros(3)
+        self._use_recovery = False
 
     def _measure_hand_frame(self) -> tuple[np.ndarray, np.ndarray]:
         """Return the home grasp orientation and the pinch offset in the site frame."""
@@ -117,20 +137,70 @@ class ScriptedPegOracle:
         self._settle_steps = 0
         self._peg_ref = self.env.data.xpos[self._peg_body_id].copy()
 
+        # Half of the demos approach with a small lateral offset, dip, then lift
+        # and recenter, so the dataset contains recovery behaviour.
+        rng = self.env.np_random
+        if rng.random() < _RECOVERY_PROB:
+            angle = rng.uniform(0.0, 2.0 * np.pi)
+            radius = rng.uniform(*_RECOVERY_RADIUS)
+            self._recovery_offset = np.array(
+                [radius * np.cos(angle), radius * np.sin(angle), 0.0]
+            )
+            self._use_recovery = True
+            self._phases = self.RECOVERY_PHASES
+        else:
+            self._recovery_offset = np.zeros(3)
+            self._use_recovery = False
+            self._phases = self.PHASE_NAMES
+
     def _target_for_phase(self) -> tuple[np.ndarray, float]:
         socket = self.env.data.site_xpos[self._socket_site_id]
         peg = self._peg_ref
+        name = self._phases[self._phase]
 
-        if self._phase == 0:
+        if name == "hover":
             return np.array([peg[0], peg[1], peg[2] + _HOVER_HEIGHT]), 1.0
-        if self._phase == 1:
+        if name == "descend":
             return np.array([peg[0], peg[1], peg[2] + _GRASP_HEIGHT]), 1.0
-        if self._phase == 2:
+        if name == "close":
             return self._hold_target, -1.0
-        if self._phase == 3:
+        if name == "lift":
             return np.array([peg[0], peg[1], peg[2] + _LIFT_HEIGHT]), -1.0
-        if self._phase == 4:
-            return np.array([socket[0], socket[1], socket[2] + _TRANSFER_HEIGHT]), -1.0
+
+        offset = self._recovery_offset
+        if name == "transfer":
+            return (
+                np.array(
+                    [
+                        socket[0] + offset[0],
+                        socket[1] + offset[1],
+                        socket[2] + _TRANSFER_HEIGHT,
+                    ]
+                ),
+                -1.0,
+            )
+        if name == "probe":
+            return (
+                np.array(
+                    [
+                        socket[0] + offset[0],
+                        socket[1] + offset[1],
+                        socket[2] + _INSERT_HEIGHT + _PROBE_HEIGHT,
+                    ]
+                ),
+                -1.0,
+            )
+        if name == "recenter":
+            return (
+                np.array(
+                    [
+                        socket[0],
+                        socket[1],
+                        socket[2] + _INSERT_HEIGHT + _RECENTER_HEIGHT,
+                    ]
+                ),
+                -1.0,
+            )
 
         target = np.array([socket[0], socket[1], socket[2] + _INSERT_HEIGHT])
         # Close the loop on the measured peg tip: the jaws let the peg sag a few
@@ -151,13 +221,14 @@ class ScriptedPegOracle:
         return self._insert_cmd, -1.0
 
     def _advance_phase(self) -> None:
-        self._phase = min(self._phase + 1, len(self.PHASE_NAMES) - 1)
+        self._phase = min(self._phase + 1, len(self._phases) - 1)
         self._phase_steps = 0
         self._settle_steps = 0
-        if self._phase == 2:
+        name = self._phases[self._phase]
+        if name == "close":
             peg = self._peg_ref
             self._hold_target = np.array([peg[0], peg[1], peg[2] + _GRASP_HEIGHT])
-        if self._phase == 5:
+        if name == "insert":
             socket = self.env.data.site_xpos[self._socket_site_id]
             pinch, _ = self._pose(self.env.data)
             self._insert_cmd = np.array([socket[0], socket[1], pinch[2]])
@@ -172,6 +243,7 @@ class ScriptedPegOracle:
         arm_dof = max(1, nu - 1)
 
         target, gripper_cmd = self._target_for_phase()
+        phase_name = self._phases[self._phase]
 
         # Plan on the commanded joint targets rather than the measured joints:
         # the position servos are under-damped, and closing the loop on the
@@ -191,10 +263,10 @@ class ScriptedPegOracle:
         actual_err = float(np.linalg.norm(target - pinch_act))
 
         self._phase_steps += 1
-        if self._phase == 2:
+        if phase_name == "close":
             if self._phase_steps >= _GRIP_CLOSE_STEPS:
                 self._advance_phase()
-        elif self._phase == 1:
+        elif phase_name == "descend":
             # Wait until the physical arm has caught up before closing the jaws.
             if pos_ok and rot_ok and actual_err < _GRASP_SYNC_TOL:
                 self._settle_steps += 1
@@ -202,11 +274,13 @@ class ScriptedPegOracle:
                     self._advance_phase()
             else:
                 self._settle_steps = 0
-        elif self._phase < 5 and pos_ok and rot_ok:
+        elif phase_name == "probe":
+            if self._phase_steps >= _PROBE_STEPS:
+                self._advance_phase()
+        elif phase_name != "insert" and pos_ok and rot_ok:
             self._advance_phase()
 
-        if self._phase_steps > _MAX_PHASE_STEPS and self._phase < 5:
-            phase_name = self.PHASE_NAMES[self._phase]
+        if self._phase_steps > _MAX_PHASE_STEPS and phase_name != "insert":
             self.last_status = (
                 f"timeout in phase '{phase_name}' after {self._phase_steps} steps "
                 f"(pos_err={np.linalg.norm(err_pos):.4f} m, "
@@ -233,7 +307,9 @@ class ScriptedPegOracle:
         dq = dq + null_proj @ dq_null
 
         action = np.zeros(nu, dtype=np.float32)
-        gain = self.gain if self._phase < 3 else self.slow_gain
+        gain = (
+            self.gain if phase_name in ("hover", "descend", "close") else self.slow_gain
+        )
         action[:arm_dof] = np.clip(
             gain * dq / max(self.env.action_scale, 1e-6), -1.0, 1.0
         )
